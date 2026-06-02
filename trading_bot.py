@@ -84,12 +84,12 @@ def build_clients():
 # ── Market-hours guard ────────────────────────────────────────────────────────
 
 def in_trading_window() -> bool:
-    """Mon–Fri, 9:00 AM – 4:30 PM ET (30 min before open, 30 min after close)."""
+    """Mon–Fri, 8:00 AM – 5:30 PM ET (market is 9:30 AM - 4:00 PM ET)."""
     now = datetime.now(ET)
     if now.weekday() >= 5:          # Saturday=5, Sunday=6
         return False
-    start = now.replace(hour=9,  minute=0,  second=0, microsecond=0)
-    end   = now.replace(hour=16, minute=30, second=0, microsecond=0)
+    start = now.replace(hour=8,  minute=0,  second=0, microsecond=0)
+    end   = now.replace(hour=17, minute=30, second=0, microsecond=0)
     return start <= now <= end
 
 
