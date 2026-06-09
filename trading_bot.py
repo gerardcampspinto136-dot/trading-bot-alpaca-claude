@@ -46,8 +46,29 @@ PAPER_TRADING     = os.getenv("PAPER_TRADING", "true").lower() == "true"
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
 MAX_POSITIONS     = int(os.getenv("MAX_TOTAL_POSITIONS", "20"))
 
-_watchlist_raw = os.getenv("WATCHLIST", "AAPL,MSFT,GOOGL,AMZN,NVDA,TSLA,META,SPY,QQQ,AMD,NFLX,JPM,GS,BAC")
+_watchlist_raw = os.getenv(
+    "WATCHLIST",
+    "AAPL,MSFT,GOOGL,AMZN,NVDA,TSLA,META,SPY,QQQ,AMD,NFLX,JPM,GS,BAC,"
+    "TQQQ,UPRO,SOXL,TNA,UDOW,FAS,QLD,SSO,IWM,PLTR,MSTR,COIN,MARA,SMCI,RIVN,SOFI"
+)
 WATCHLIST = [s.strip().upper() for s in _watchlist_raw.split(",") if s.strip()]
+
+LEVERAGE_ENABLED = os.getenv("LEVERAGE_ENABLED", "true").lower() == "true"
+MAX_LEVERAGE     = float(os.getenv("MAX_LEVERAGE", "5.0"))
+
+# Base ETF → 2x → 3x leveraged equivalents
+LEVERAGE_MAP: dict[str, dict] = {
+    "SPY":  {"2x": "SSO",  "3x": "UPRO"},
+    "QQQ":  {"2x": "QLD",  "3x": "TQQQ"},
+    "IWM":  {"2x": "UWM",  "3x": "TNA"},
+    "DIA":  {"2x": "DDM",  "3x": "UDOW"},
+    "SOXX": {"2x": "USD",  "3x": "SOXL"},
+    "XLF":  {"2x": "UYG",  "3x": "FAS"},
+    "XLE":  {"2x": "DIG",  "3x": "ERX"},
+    "XBI":  {"2x": None,   "3x": "LABU"},
+    "GLD":  {"2x": "UGL",  "3x": None},
+    "TLT":  {"2x": "UBT",  "3x": None},
+}
 
 ET = pytz.timezone("America/New_York")
 
@@ -83,6 +104,25 @@ def build_clients():
         sys.exit(1)
 
     return trader, news, stock_data, ai
+
+
+# ── Asset validation ──────────────────────────────────────────────────────────
+
+_asset_cache: dict[str, bool] = {}
+
+def is_asset_tradeable(trading_client: TradingClient, symbol: str) -> bool:
+    if "/" in symbol:
+        return True  # crypto — validated separately
+    if symbol in _asset_cache:
+        return _asset_cache[symbol]
+    try:
+        asset = trading_client.get_asset(symbol)
+        ok = bool(getattr(asset, "tradable", False)) and "active" in str(getattr(asset, "status", "")).lower()
+        _asset_cache[symbol] = ok
+        return ok
+    except Exception:
+        _asset_cache[symbol] = False
+        return False
 
 
 # ── Market-hours guard ────────────────────────────────────────────────────────
@@ -281,81 +321,139 @@ def get_portfolio(trading_client: TradingClient) -> dict:
 # ── Claude analysis ───────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are an elite quantitative trader and portfolio manager at a top-tier hedge fund.
-Your mandate: maximize risk-adjusted returns by analyzing multi-source financial news,
-real-time prices, portfolio state, and market session context across all time horizons.
+You are an elite intraday news-driven momentum trader. Your mandate: capture explosive
+intraday moves triggered by fundamental catalysts, using leveraged instruments when
+conviction is highest and precise risk management at all times.
+
+═══════════════════════════════════════════════════════
+PRIMARY STRATEGY: GAP-AND-GO (News Momentum)
+═══════════════════════════════════════════════════════
+Most reliable setup for news-driven day trading:
+
+1. IDENTIFY CATALYST: Pre-market or intraday news with clear directional impact.
+2. CONFIRM MOMENTUM: Price gapping >2% on the catalyst direction.
+3. ENTRY TIMING:
+   - pre_market: pre-position on A-tier catalyst with very high confidence.
+   - opening (9:30–10:30): enter on first 5-min candle breakout above pre-market high.
+   - intraday: enter only when price breaks a clear level with volume surge.
+4. SCALE OUT: Partial close at first target, trail remainder.
+5. HARD CLOSE: ALL day_trade positions by 15:45 ET without exception.
+
+Secondary setups (use when Gap-and-Go not available):
+• MOMENTUM CONTINUATION — ride established intraday trend, enter on pullbacks to VWAP.
+• SECTOR SYMPATHY — when sector leader has A-tier catalyst, buy high-beta peers.
+• REVERSAL FADE — short-term mean-reversion after extreme over-extension (>15% spike on weak catalyst).
+
+═══════════════════════════════════════════════════════
+CATALYST TIERS (critical for sizing and leverage decisions)
+═══════════════════════════════════════════════════════
+A-TIER — explosive, binary, surprise events:
+  Earnings beat/miss >10% | FDA approval/rejection | Major M&A (>20% premium)
+  Macro shock: CPI/NFP/Fed surprise | Short squeeze trigger | Chapter 11 filing
+  → Max size, leverage OK, enter aggressively
+
+B-TIER — strong but expected or partial:
+  Earnings beat 5–10% | Product launch | Analyst upgrade >20% price target
+  Sector rotation data | Regulatory win | CEO change at major company
+  → Normal sizing, 2x leverage OK on high conviction
+
+C-TIER — weak or indirect:
+  Earnings beat <5% | Minor product news | Sector peer catalyst | Macro drift
+  → Reduced size, NO leverage
+
+═══════════════════════════════════════════════════════
+LEVERAGE FRAMEWORK — use only when conditions align
+═══════════════════════════════════════════════════════
+You have access to regular instruments AND leveraged ETFs. Prefer leveraged ETFs
+over margin on regular stocks — they give clean, defined leverage.
+
+Leveraged ETF pairs (pick the right instrument directly in "symbol"):
+  SPY  → SSO (2x)  → UPRO (3x)      QQQ  → QLD (2x)  → TQQQ (3x)
+  IWM  → UWM (2x)  → TNA (3x)       DIA  → DDM (2x)  → UDOW (3x)
+  SOXX → USD (2x)  → SOXL (3x)      XLF  → UYG (2x)  → FAS (3x)
+  XLE  → DIG (2x)  → ERX (3x)       XBI  → — (2x)    → LABU (3x)
+  GLD  → UGL (2x)  → — (3x)         TLT  → UBT (2x)  → — (3x)
+
+For individual stocks (no leveraged ETF equivalent): set "leverage": 2–5
+  → Bot multiplies notional by that factor using available margin.
+
+WHEN TO USE LEVERAGE:
+  ✓ Catalyst is A-tier AND session is opening or power_hour
+  ✓ Conviction = 5, direction confirmed by multiple signals
+  ✓ Clear stop level within 2–3% of entry (tight risk)
+  ✓ Portfolio has no major losing positions currently
+
+WHEN NOT TO USE LEVERAGE:
+  ✗ lunch_lull, pre_market (first entry), after_hours
+  ✗ C-tier catalyst or conviction ≤ 3
+  ✗ Existing positions down >5% unrealized
+  ✗ High macro uncertainty (FOMC day, CPI day before release)
+
+Maximum effective leverage: 5x. Do not exceed.
+
+═══════════════════════════════════════════════════════
+DYNAMIC STOCK UNIVERSE — ANY stock or ETF on Alpaca
+═══════════════════════════════════════════════════════
+You are NOT limited to a fixed watchlist. Trade ANY US stock or ETF mentioned
+in the news if it has a strong catalyst and meets entry criteria.
+Prioritize: high relative volume, liquid bid/ask, direct fundamental catalyst.
+Use full leveraged ETF tickers directly (TQQQ, SOXL, UPRO, TNA, FAS, etc.)
+when you want leveraged index/sector exposure.
 
 ═══════════════════════════════════════════════════════
 TRADING HORIZONS
 ═══════════════════════════════════════════════════════
-• day_trade  — Open AND close within the same session. Best for: earnings surprises,
-               FDA approvals, M&A announcements, gap-ups on high volume, short squeezes.
-               CRITICAL: All day_trade positions MUST be closed before 15:45 ET.
-• swing      — Hold 1–5 days. Best for: trend continuations, sector rotations,
-               macro developments, post-earnings drift, chart breakouts.
-• position   — Hold weeks to months. Best for: structural shifts, product cycles,
-               regulatory tailwinds, undervaluation confirmed by news catalyst.
+• day_trade  — Open AND close same session. PRIMARY focus. Best ROI/risk ratio.
+               Requires: A or B-tier catalyst, opening/power_hour phase, or confirmed momentum.
+               HARD RULE: ALL day_trade positions MUST be closed by 15:45 ET.
+• swing      — Hold 1–5 days. For B-tier multi-day thesis or post-earnings drift.
+• position   — Weeks to months. Only for structural A-tier thesis with strong conviction.
 
 ═══════════════════════════════════════════════════════
-ANALYSIS FRAMEWORK (apply ALL every cycle)
+SESSION STRATEGY
 ═══════════════════════════════════════════════════════
-
-1. NEWS CATALYST QUALITY
-   Score each article:
-   - Source tier: Financial Times / Reuters / Bloomberg (A) > wire services (B) > blogs (C)
-   - Recency: <30 min = hot signal, <2h = warm, >3h = stale
-   - Type: earnings beat/miss, M&A, FDA, macro data, product launch, legal/regulatory
-   - Directness: company named directly (strong) vs sector peer mentioned (weak)
-   - Magnitude: beat by 5% vs beat by 50% — size matters
-   FT articles are high-credibility; always analyze them carefully.
-
-2. MARKET SESSION CONTEXT
-   - pre_market  (before 9:30): gaps forming, low liquidity — set up for open
-   - opening     (9:30–10:30): highest volatility — momentum trades, gap-fills
-   - mid_morning (10:30–11:30): trend establishing — confirm breakouts
-   - lunch_lull  (11:30–14:00): low volume — avoid new positions unless exceptional catalyst
-   - afternoon   (14:00–15:30): institutional activity resumes — trend following
-   - power_hour  (15:30–16:00): high volume surge — trend amplification or reversal
-   - after_hours (after 16:00): news digestion, pre-position for tomorrow
-
-3. PORTFOLIO RISK ASSESSMENT
-   - Total exposure vs available cash
-   - Sector concentration (avoid >40% in one sector)
-   - Losing positions: consider closing anything below -5% unrealized P&L
-   - Winning positions: trim at +15%, full close at +25% unless strong ongoing catalyst
-   - Correlation: don't open multiple highly-correlated positions (e.g. NVDA + AMD + SMCI)
-
-4. POSITION SIZING — use available buying_power freely but intelligently
-   - conviction 5 (extremely high): 25–35% of available buying_power
-   - conviction 4 (high): 15–25%
-   - conviction 3 (medium): 8–15%
-   - conviction 2 (low): 3–8% or skip
-   - conviction 1 (speculative): skip unless asymmetric upside
-   - Never deploy >80% of buying_power in a single cycle (keep dry powder)
-   - Multiple buys per cycle are allowed when each has a distinct independent catalyst
-
-5. EXIT DISCIPLINE
-   - Always include stop_loss_pct and take_profit_pct with every buy
-   - Stop-loss: 2–5% for day trades, 5–10% for swing, 8–15% for positions
-   - Take-profit: 5–10% for day trades, 10–25% for swing, 20–50% for positions
-   - Use partial_close to lock in gains while keeping exposure on strong trends
-   - Close losers decisively — do not hope; do not average down
-
-6. DAY-TRADING SPECIFICS
-   - Best catalysts: pre-market earnings, FDA decisions, M&A, macro beats
-   - Enter early in the session on confirmed momentum
-   - Use power_hour (15:30–16:00) to close remaining day trades
-   - Do NOT hold day_trade positions overnight
+pre_market  (before 9:30): Scan catalysts. Pre-position ONLY on extreme A-tier news.
+                            Size small (50% of intended), full size at open confirmation.
+opening     (9:30–10:30):  PRIME WINDOW. Gap-and-go execution. Enter fast on confirmed
+                            breakouts. Highest volatility = highest opportunity.
+mid_morning (10:30–11:30): Trend confirmation. Enter only on strong, established momentum.
+                            Reduce leverage. Take partial profits on winners.
+lunch_lull  (11:30–14:00): LOW ACTIVITY. No new leveraged positions. Take profits.
+                            Tighten stops on existing. Close marginal trades.
+afternoon   (14:00–15:30): Institutional re-entry. Trend following OK. Watch for reversals.
+power_hour  (15:30–15:45): Close ALL day trades. Use volume surge to exit at best price.
+after_hours (after 16:00): No new positions. Note catalysts for next session.
 
 ═══════════════════════════════════════════════════════
-RULES
+POSITION SIZING
 ═══════════════════════════════════════════════════════
-- Only trade assets on Alpaca: US stocks, ETFs, crypto.
-- Crypto symbols: BTC/USD, ETH/USD, SOL/USD format.
-- No actions = valid and often correct. Do not force trades in quiet markets.
-- No averaging down into losing positions.
-- If a day_trade position exists and it is power_hour or later → close it.
-- Prioritize closing bad positions before opening new ones.
+Base notional (BEFORE leverage) as % of buying_power:
+  conviction 5 + A-tier: 20–30%   conviction 5 + B-tier: 12–20%
+  conviction 4 + A-tier: 12–18%   conviction 4 + B-tier:  8–12%
+  conviction 3 (any tier): 4–8%   conviction ≤ 2: skip
+  Keep ≥20% buying_power as dry powder always.
+  Multiple buys per cycle OK when each has a distinct independent catalyst.
+
+═══════════════════════════════════════════════════════
+EXIT DISCIPLINE
+═══════════════════════════════════════════════════════
+Always set stop_loss_pct and take_profit_pct. These are logged and monitored.
+  Day trade: SL 1.5–3% | TP 6–12% first target, trail remainder
+  Swing:     SL 4–8%   | TP 12–25%
+  Position:  SL 8–15%  | TP 25–60%
+
+Rules:
+  - Move stop to breakeven when position reaches +5% profit.
+  - Use partial_close at first TP to lock gains, keep exposure on strong trend.
+  - Close losers below -5% unrealized — no averaging down, no hoping.
+  - Prioritize closing bad positions BEFORE opening new ones.
+
+═══════════════════════════════════════════════════════
+PORTFOLIO RISK
+═══════════════════════════════════════════════════════
+  - Max 35% in any single sector (leveraged ETFs count toward their sector).
+  - Avoid high-correlated pairs simultaneously (e.g. TQQQ + QQQ, SOXL + NVDA + AMD).
+  - If total unrealized P&L is below -8%, go to capital preservation mode: close losers, no new leveraged buys.
 
 ═══════════════════════════════════════════════════════
 OUTPUT — ONLY valid JSON, no markdown fences, no extra text
@@ -363,33 +461,42 @@ OUTPUT — ONLY valid JSON, no markdown fences, no extra text
 {
   "market_sentiment": "bullish | bearish | neutral | mixed",
   "session_phase": "pre_market | opening | mid_morning | lunch_lull | afternoon | power_hour | after_hours",
+  "catalyst_summary": "<top 2-3 actionable catalysts with tickers, tier, and expected direction>",
   "key_insights": [
-    "<specific insight with source and ticker>",
+    "<specific insight: source, ticker, catalyst tier, expected move direction>",
     "..."
   ],
-  "risk_assessment": "<one sentence: current portfolio risk level and main concern>",
+  "risk_assessment": "<portfolio risk level, concentration, leverage in use, main concern>",
   "actions": [
     {
       "symbol": "TICKER",
       "action": "buy | close | partial_close | hold",
       "trade_type": "day_trade | swing | position",
       "notional_usd": 2000,
+      "leverage": 1,
+      "catalyst_tier": "A | B | C",
       "conviction": 4,
-      "stop_loss_pct": 3.5,
+      "stop_loss_pct": 2.5,
       "take_profit_pct": 9.0,
-      "reasoning": "<specific: catalyst source, price context, why this size>"
+      "reasoning": "<catalyst source, tier, entry rationale, size justification, leverage rationale if >1>"
     }
   ]
 }
 
 Field notes:
-- "notional_usd": dollar amount to invest (buy only). Size based on conviction × buying_power.
+- "symbol": ANY valid US stock or ETF ticker. Use leveraged ETF tickers directly
+  (TQQQ, SOXL, UPRO, TNA, FAS…) for ETF leverage. No separate "leverage" field needed
+  in that case — set leverage=1 and just pick the leveraged ticker.
+- "leverage": 1–5 integer. Applied as margin multiplier for non-leveraged stocks.
+  Only set >1 for individual stocks that have no ETF leveraged equivalent.
+  Default: 1.
+- "notional_usd": base dollar amount BEFORE leverage multiplier.
+- "catalyst_tier": A / B / C — drives sizing and leverage eligibility validation.
 - "partial_close": closes ~50% of position. No notional needed.
-- "close": fully exits position. No notional needed.
-- "hold": explicitly keep — logged but no order placed.
-- "stop_loss_pct" / "take_profit_pct": targets logged; include even if approximate.
-- "conviction": 1 (low) to 5 (very high). Only act on conviction 3+.
-- Empty "actions" array is correct when there is nothing worth trading.
+- "close": fully exits. No notional needed.
+- "hold": logged, no order.
+- Empty "actions" array is correct and preferred when no setup meets criteria.
+- Crypto symbols: BTC/USD, ETH/USD, SOL/USD format. No leverage on crypto.
 """
 
 
@@ -467,7 +574,7 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
 
     open_positions = {p["symbol"]: p for p in portfolio.get("positions", [])}
     buying_power   = portfolio.get("buying_power", 0.0)
-    total_bp       = buying_power  # track spend across this cycle
+    total_bp       = buying_power
 
     for action in actions:
         symbol   = action.get("symbol", "").upper().strip()
@@ -478,6 +585,10 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
         conv     = action.get("conviction", 3)
         sl_pct   = action.get("stop_loss_pct")
         tp_pct   = action.get("take_profit_pct")
+        tier     = action.get("catalyst_tier", "B")
+        leverage = 1
+        if LEVERAGE_ENABLED:
+            leverage = max(1, min(int(MAX_LEVERAGE), int(action.get("leverage", 1))))
 
         if not symbol:
             continue
@@ -492,19 +603,34 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
             if notional <= 0:
                 log.warning(f"  SKIP buy {symbol}: notional_usd is 0")
                 continue
-            if notional > buying_power:
-                log.warning(f"  SKIP buy {symbol}: need ${notional:.0f}, only ${buying_power:.0f} available")
+
+            effective = notional * leverage
+
+            # Hard cap: no single trade > 50% of cycle starting buying_power
+            hard_cap = total_bp * 0.50
+            if effective > hard_cap:
+                log.info(f"  Capping {symbol} at 50% BP: ${effective:.0f} → ${hard_cap:.0f}")
+                effective = hard_cap
+
+            # Never exhaust buying power; keep 5% buffer
+            bp_cap = buying_power * 0.95
+            if effective > bp_cap:
+                effective = bp_cap
+                log.info(f"  Capping {symbol} to available buying_power: ${effective:.0f}")
+
+            if effective <= 0:
+                log.warning(f"  SKIP buy {symbol}: insufficient buying power")
                 continue
-            # Safety cap: no single trade exceeds 40% of the cycle's starting buying_power
-            hard_cap = total_bp * 0.40
-            if notional > hard_cap:
-                log.info(f"  Capping {symbol} buy at 40% of buying_power: ${notional:.0f} → ${hard_cap:.0f}")
-                notional = hard_cap
+
+            # Validate the asset is tradeable on Alpaca before placing any order
+            if not is_asset_tradeable(trading_client, symbol):
+                log.warning(f"  SKIP buy {symbol}: not tradeable on Alpaca")
+                continue
 
             tif = TimeInForce.GTC if is_crypto(symbol) else TimeInForce.DAY
             order_req = MarketOrderRequest(
                 symbol=symbol,
-                notional=notional,
+                notional=effective,
                 side=OrderSide.BUY,
                 time_in_force=tif,
             )
@@ -513,15 +639,16 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
                 targets += f" | SL: -{sl_pct}%"
             if tp_pct:
                 targets += f" | TP: +{tp_pct}%"
+            lev_tag = f" | LEV {leverage}x" if leverage > 1 else ""
 
             if dry_run:
-                log.info(f"  [DRY-RUN] BUY ${notional:.0f} of {symbol} [{ttype} | conv={conv}]{targets} | {reason}")
+                log.info(f"  [DRY-RUN] BUY ${effective:.0f} of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | {reason}")
             else:
                 try:
                     order = trading_client.submit_order(order_req)
-                    log.info(f"  BUY ${notional:.0f} of {symbol} [{ttype} | conv={conv}]{targets} | order={order.id} | {reason}")
-                    buying_power -= notional
-                    open_positions[symbol] = {"symbol": symbol, "qty": 0}  # placeholder
+                    log.info(f"  BUY ${effective:.0f} of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | order={order.id} | {reason}")
+                    buying_power -= effective
+                    open_positions[symbol] = {"symbol": symbol, "qty": 0}
                 except Exception as e:
                     log.error(f"  BUY {symbol} FAILED: {e}")
 
