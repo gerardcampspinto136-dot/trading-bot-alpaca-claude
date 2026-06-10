@@ -324,17 +324,22 @@ def get_portfolio(trading_client: TradingClient) -> dict:
 
 # ── User hints ────────────────────────────────────────────────────────────────
 
-def load_user_hints() -> str:
-    """Read user guidance from hints.txt (created automatically if missing)."""
+_telegram_offset = 0  # tracks last processed Telegram update
+
+
+def _hints_file_init() -> None:
+    """Create hints.txt with comment header if it doesn't exist."""
     if not os.path.exists(HINTS_FILE):
         with open(HINTS_FILE, "w", encoding="utf-8") as f:
             f.write(
-                "# Write your trading hints here — one per line.\n"
-                "# The bot reads this file before every analysis cycle.\n"
-                "# Example: Look into NVDA today, strong earnings catalyst.\n"
-                "# Example: Avoid tech stocks, macro uncertainty this week.\n"
+                "# Trading hints — edited by hand or via Telegram.\n"
+                "# Lines starting with # are ignored.\n"
             )
-        return ""
+
+
+def load_user_hints() -> str:
+    """Return all active (non-comment) lines from hints.txt."""
+    _hints_file_init()
     try:
         with open(HINTS_FILE, "r", encoding="utf-8") as f:
             lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
@@ -344,6 +349,78 @@ def load_user_hints() -> str:
     except Exception as e:
         log.warning(f"Could not read {HINTS_FILE}: {e}")
         return ""
+
+
+def _append_hints(hints: list[str]) -> None:
+    _hints_file_init()
+    with open(HINTS_FILE, "a", encoding="utf-8") as f:
+        for h in hints:
+            f.write(h + "\n")
+    log.info(f"Saved {len(hints)} hint(s) from Telegram.")
+
+
+def _clear_hints() -> None:
+    if not os.path.exists(HINTS_FILE):
+        return
+    with open(HINTS_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    with open(HINTS_FILE, "w", encoding="utf-8") as f:
+        f.writelines(l for l in lines if not l.strip() or l.strip().startswith("#"))
+    log.info("Hints cleared via Telegram /clear command.")
+
+
+def poll_telegram_hints() -> None:
+    """Fetch new Telegram messages and handle them as hints or commands."""
+    global _telegram_offset
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        import urllib.request
+        url = (
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+            f"/getUpdates?offset={_telegram_offset}&timeout=0"
+        )
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        if not data.get("ok"):
+            return
+
+        new_hints: list[str] = []
+        for update in data.get("result", []):
+            _telegram_offset = update["update_id"] + 1
+            msg     = update.get("message", {})
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+            text = msg.get("text", "").strip()
+            if not text:
+                continue
+
+            if text.lower() in ("/clear", "clear"):
+                _clear_hints()
+                send_telegram("All hints cleared.")
+
+            elif text.lower() in ("/hints", "hints"):
+                active = load_user_hints()
+                if active:
+                    send_telegram(f"*Active hints:*\n" + "\n".join(f"• {l}" for l in active.splitlines()))
+                else:
+                    send_telegram("No active hints.")
+
+            elif text.startswith("/"):
+                send_telegram("Commands: /hints — list active hints | /clear — remove all hints\nOr just send any message to add a hint.")
+
+            else:
+                new_hints.append(text)
+
+        if new_hints:
+            _append_hints(new_hints)
+            bullet_list = "\n".join(f"• {h}" for h in new_hints)
+            send_telegram(f"Got it! Hint(s) saved — I'll use them in the next cycle:\n{bullet_list}")
+
+    except Exception as e:
+        log.warning(f"Telegram poll failed: {e}")
 
 
 # ── Telegram notifications ────────────────────────────────────────────────────
@@ -790,6 +867,8 @@ def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run
     log.info(f"Cycle start: {datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')} | Session: {phase.upper()}")
     log.info("-" * 60)
 
+    poll_telegram_hints()
+
     lookback = max(3, CHECK_INTERVAL // 20 + 1)
     news      = fetch_all_news(news_client, lookback_hours=lookback)
     portfolio = get_portfolio(trading_client)
@@ -856,6 +935,8 @@ def main():
         return
 
     trading_client, news_client, stock_data_client, ai_client = build_clients()
+
+    poll_telegram_hints()  # pick up any messages sent while bot was offline
 
     def cycle():
         run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run=args.dry_run)
