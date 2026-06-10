@@ -56,6 +56,10 @@ WATCHLIST = [s.strip().upper() for s in _watchlist_raw.split(",") if s.strip()]
 LEVERAGE_ENABLED = os.getenv("LEVERAGE_ENABLED", "true").lower() == "true"
 MAX_LEVERAGE     = float(os.getenv("MAX_LEVERAGE", "5.0"))
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+HINTS_FILE         = "hints.txt"
+
 # Base ETF → 2x → 3x leveraged equivalents
 LEVERAGE_MAP: dict[str, dict] = {
     "SPY":  {"2x": "SSO",  "3x": "UPRO"},
@@ -318,6 +322,90 @@ def get_portfolio(trading_client: TradingClient) -> dict:
     }
 
 
+# ── User hints ────────────────────────────────────────────────────────────────
+
+def load_user_hints() -> str:
+    """Read user guidance from hints.txt (created automatically if missing)."""
+    if not os.path.exists(HINTS_FILE):
+        with open(HINTS_FILE, "w", encoding="utf-8") as f:
+            f.write(
+                "# Write your trading hints here — one per line.\n"
+                "# The bot reads this file before every analysis cycle.\n"
+                "# Example: Look into NVDA today, strong earnings catalyst.\n"
+                "# Example: Avoid tech stocks, macro uncertainty this week.\n"
+            )
+        return ""
+    try:
+        with open(HINTS_FILE, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        if lines:
+            log.info(f"User hints loaded: {len(lines)} line(s)")
+        return "\n".join(lines)
+    except Exception as e:
+        log.warning(f"Could not read {HINTS_FILE}: {e}")
+        return ""
+
+
+# ── Telegram notifications ────────────────────────────────────────────────────
+
+def send_telegram(message: str) -> None:
+    """Send a message to the configured Telegram bot."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        import urllib.request, urllib.parse
+        payload = json.dumps({
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       message,
+            "parse_mode": "Markdown",
+        }).encode()
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(req, timeout=10)
+        log.info("Telegram notification sent.")
+    except Exception as e:
+        log.warning(f"Telegram notification failed: {e}")
+
+
+def format_notification(analysis: dict, phase: str) -> str:
+    """Build a short Telegram message summarising the cycle."""
+    now_str   = datetime.now(ET).strftime("%H:%M ET")
+    sentiment = analysis.get("market_sentiment", "?").upper()
+    actions   = [a for a in analysis.get("actions", []) if a.get("action", "hold") != "hold"]
+
+    EMOJI = {"buy": "BUY", "close": "CLOSE", "partial_close": "PARTIAL CLOSE"}
+    lines = [
+        f"*Trading Bot* | {now_str} | {phase.upper()}",
+        f"Sentiment: {sentiment}",
+    ]
+
+    catalyst = analysis.get("catalyst_summary", "")
+    if catalyst:
+        lines.append(f"_{catalyst[:120]}_")
+
+    lines.append("")
+
+    if actions:
+        lines.append("*Actions:*")
+        for a in actions:
+            sym     = a.get("symbol", "?")
+            act     = EMOJI.get(a.get("action", ""), a.get("action", "").upper())
+            reason  = a.get("reasoning", "")
+            short_r = reason[:100] + ("…" if len(reason) > 100 else "")
+            notl    = a.get("notional_usd", 0)
+            if a.get("action") == "buy":
+                lines.append(f"• {act} ${notl:,.0f} *{sym}* — {short_r}")
+            else:
+                lines.append(f"• {act} *{sym}* — {short_r}")
+    else:
+        lines.append("_No trades — no setup met criteria this cycle._")
+
+    return "\n".join(lines)
+
+
 # ── Claude analysis ───────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
@@ -506,10 +594,15 @@ def analyze(
     portfolio: dict,
     prices: dict,
     phase: str,
+    user_hints: str = "",
 ) -> dict | None:
     news_blob      = json.dumps(news[:40], indent=2)
     portfolio_blob = json.dumps(portfolio, indent=2)
     prices_blob    = json.dumps(prices, indent=2) if prices else "{}"
+
+    hints_section = ""
+    if user_hints:
+        hints_section = f"\n=== OWNER GUIDANCE (apply this when analysing) ===\n{user_hints}\n"
 
     user_msg = f"""\
 CURRENT DATE/TIME (ET): {datetime.now(ET).strftime('%Y-%m-%d %H:%M')}
@@ -517,7 +610,7 @@ MARKET SESSION PHASE: {phase}
 AVAILABLE BUYING POWER: ${portfolio['buying_power']:,.2f}
 PORTFOLIO VALUE: ${portfolio['portfolio_value']:,.2f}
 OPEN POSITIONS: {len(portfolio['positions'])}
-
+{hints_section}
 === RECENT FINANCIAL NEWS (Alpaca + Financial Times) ===
 {news_blob}
 
@@ -712,12 +805,16 @@ def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run
         f"Open positions: {len(portfolio['positions'])}"
     )
 
-    analysis = analyze(ai_client, news, portfolio, prices, phase)
+    hints    = load_user_hints()
+    analysis = analyze(ai_client, news, portfolio, prices, phase, user_hints=hints)
     if analysis is None:
         log.error("Analysis failed — skipping execution this cycle.")
         return
 
     execute(trading_client, analysis.get("actions", []), portfolio, dry_run)
+
+    notification = format_notification(analysis, phase)
+    send_telegram(notification)
     log.info("Cycle complete.\n")
 
 
@@ -735,6 +832,11 @@ def main():
         action="store_true",
         help="Run a single cycle immediately and exit (useful for testing)",
     )
+    parser.add_argument(
+        "--notify-test",
+        action="store_true",
+        help="Send a test Telegram message to verify the bot is configured correctly",
+    )
     args = parser.parse_args()
 
     mode_tag = "DRY-RUN " if args.dry_run else ""
@@ -743,6 +845,15 @@ def main():
 
     if not PAPER_TRADING and not args.dry_run:
         log.warning("⚠  LIVE TRADING IS ENABLED — real money will be used!")
+
+    if args.notify_test:
+        msg = (
+            "*Trading Bot* — test notification\n"
+            "If you see this, Telegram is configured correctly."
+        )
+        send_telegram(msg)
+        log.info("Test notification sent (or failed — check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).")
+        return
 
     trading_client, news_client, stock_data_client, ai_client = build_clients()
 
