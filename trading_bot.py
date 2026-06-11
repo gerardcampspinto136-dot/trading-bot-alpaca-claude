@@ -820,7 +820,7 @@ def is_crypto(symbol: str) -> bool:
     return "/" in symbol
 
 
-def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict, dry_run: bool) -> None:
+def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict, dry_run: bool, prices: dict | None = None) -> None:
     if not actions:
         log.info("No trading actions this cycle.")
         return
@@ -934,6 +934,16 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
                 log.warning(f"  SKIP short {symbol}: not tradeable on Alpaca")
                 continue
 
+            # Short orders require qty (integer shares), not notional
+            price = (prices or {}).get(symbol)
+            if not price or price <= 0:
+                log.warning(f"  SKIP short {symbol}: no price available to calculate qty")
+                continue
+            qty = int(effective / price)
+            if qty <= 0:
+                log.warning(f"  SKIP short {symbol}: calculated qty=0 (effective=${effective:.0f}, price=${price})")
+                continue
+
             lev_tag = f" | LEV {leverage}x" if leverage > 1 else ""
             targets = ""
             if sl_pct:
@@ -943,16 +953,16 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
 
             order_req = MarketOrderRequest(
                 symbol=symbol,
-                notional=effective,
+                qty=qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
             )
             if dry_run:
-                log.info(f"  [DRY-RUN] SHORT ${effective:.0f} of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | {reason}")
+                log.info(f"  [DRY-RUN] SHORT {qty} shares (~${effective:.0f}) of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | {reason}")
             else:
                 try:
                     order = trading_client.submit_order(order_req)
-                    log.info(f"  SHORT ${effective:.0f} of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | order={order.id} | {reason}")
+                    log.info(f"  SHORT {qty} shares (~${effective:.0f}) of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | order={order.id} | {reason}")
                     buying_power -= effective
                     open_positions[symbol] = {"symbol": symbol, "qty": 0}
                 except Exception as e:
@@ -1055,7 +1065,7 @@ def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run
         log.error("Analysis failed — skipping execution this cycle.")
         return
 
-    execute(trading_client, analysis.get("actions", []), portfolio, dry_run)
+    execute(trading_client, analysis.get("actions", []), portfolio, dry_run, prices=prices)
 
     notification = format_notification(analysis, phase)
     send_telegram(notification)
