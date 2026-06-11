@@ -10,7 +10,6 @@ import json
 import time
 import argparse
 import logging
-import schedule
 import pytz
 import feedparser
 from datetime import datetime, timedelta
@@ -43,8 +42,11 @@ ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 PAPER_TRADING     = os.getenv("PAPER_TRADING", "true").lower() == "true"
-CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
 MAX_POSITIONS     = int(os.getenv("MAX_TOTAL_POSITIONS", "20"))
+
+# Fixed daily run times in ET — 5 runs, every 2 hours
+RUN_TIMES_ET      = [(8, 30), (10, 30), (12, 30), (14, 30), (16, 30)]
+NEWS_LOOKBACK_HOURS = 3  # look back slightly more than the 2-hour cycle
 
 _watchlist_raw = os.getenv(
     "WATCHLIST",
@@ -75,6 +77,23 @@ LEVERAGE_MAP: dict[str, dict] = {
 }
 
 ET = pytz.timezone("America/New_York")
+
+
+def next_run_time() -> datetime:
+    """Return the next fixed run slot (ET), skipping to next weekday if today's are done."""
+    now = datetime.now(ET)
+    today = now.date()
+    for hour, minute in RUN_TIMES_ET:
+        candidate = ET.localize(datetime(today.year, today.month, today.day, hour, minute))
+        if candidate > now:
+            return candidate
+    # All today's slots passed — advance to next weekday
+    next_day = today + timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day += timedelta(days=1)
+    hour, minute = RUN_TIMES_ET[0]
+    return ET.localize(datetime(next_day.year, next_day.month, next_day.day, hour, minute))
+
 
 FT_RSS_FEEDS = [
     "https://www.ft.com/rss/home",
@@ -876,7 +895,7 @@ def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run
 
     poll_telegram_hints()
 
-    lookback = max(3, CHECK_INTERVAL // 20 + 1)
+    lookback = NEWS_LOOKBACK_HOURS
     news      = fetch_all_news(news_client, lookback_hours=lookback)
     portfolio = get_portfolio(trading_client)
 
@@ -927,7 +946,8 @@ def main():
 
     mode_tag = "DRY-RUN " if args.dry_run else ""
     mode_tag += "PAPER" if PAPER_TRADING else "LIVE"
-    log.info(f"Starting AI Trading Bot [{mode_tag}] — interval: {CHECK_INTERVAL} min")
+    slots = ", ".join(f"{h:02d}:{m:02d}" for h, m in RUN_TIMES_ET)
+    log.info(f"Starting AI Trading Bot [{mode_tag}] — fixed runs at {slots} ET")
 
     if not PAPER_TRADING and not args.dry_run:
         log.warning("⚠  LIVE TRADING IS ENABLED — real money will be used!")
@@ -953,14 +973,13 @@ def main():
         run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run=True)
         return
 
-    cycle()
-    schedule.every(CHECK_INTERVAL).minutes.do(cycle)
-
-    log.info(f"Scheduler running — next cycle in {CHECK_INTERVAL} min. Press Ctrl+C to stop.")
     try:
         while True:
-            schedule.run_pending()
-            time.sleep(30)
+            nxt = next_run_time()
+            wait_secs = (nxt - datetime.now(ET)).total_seconds()
+            log.info(f"Next run at {nxt.strftime('%H:%M ET')} — sleeping {wait_secs / 60:.0f} min.")
+            time.sleep(max(0, wait_secs))
+            cycle()
     except KeyboardInterrupt:
         log.info("Bot stopped by user.")
 
