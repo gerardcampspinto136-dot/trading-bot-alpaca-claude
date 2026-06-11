@@ -598,19 +598,36 @@ Two ways to go short:
    Leverage field applies the same way as with longs.
 
 WHEN TO GO SHORT (direct or inverse ETF):
-  ✓ A-tier NEGATIVE catalyst: earnings miss >10%, FDA rejection, Chapter 11, major scandal
-  ✓ Index breakdown: market-wide selloff with macro shock (CPI beat, Fed hawkish surprise)
-  ✓ Reversal fade: stock spiked >15% on a weak/fraudulent catalyst — fade the hype
+
+  Hard catalysts (A-tier — act fast):
+  ✓ Earnings miss >10%, revenue miss, guidance cut
+  ✓ FDA rejection, clinical trial failure
+  ✓ Chapter 11 / bankruptcy / delisting notice
+  ✓ Major fraud, accounting scandal, DOJ/SEC investigation announced
+  ✓ Index breakdown: market-wide selloff from macro shock (CPI beat, hawkish Fed surprise)
+  ✓ Reversal fade: stock spiked >15% on a weak or fraudulent catalyst — fade the hype
   ✓ Sector contagion: sector leader collapses, short high-beta peers
 
+  Valuation / overpricing signals (B-tier — use swing trade_type):
+  ✓ High-profile investor publicly says stock is overvalued or calls it a bubble
+    (e.g. Buffett, Burry, Ackman, Einhorn, prominent short-sellers like Hindenburg/Citron)
+  ✓ Analyst downgrades to Sell/Underperform WITH a price target well below current price (>15% downside)
+  ✓ Multiple analysts simultaneously cut price targets after a weak earnings or outlook
+  ✓ Credible research report flags overvaluation, inflated revenue, or accounting irregularities
+  ✓ Stock trading at extreme multiple (P/E >100x) AND news sentiment turning negative
+  ✓ ETF or index sector widely described as "overbought", "bubble", or "frothy" by credible sources
+  ✓ Fed/treasury officials warn about specific sector valuations (e.g. AI bubble, housing bubble)
+
 WHEN NOT TO SHORT:
-  ✗ Strong uptrend without a clear catalyst reversal
+  ✗ Strong uptrend without a clear catalyst reversal or credible overvaluation claim
   ✗ Heavily shorted stock (short interest >20%) — risk of short squeeze
   ✗ Earnings approaching for target (binary event risk)
   ✗ Conviction ≤ 3 or catalyst is C-tier
+  ✗ Valuation concern alone with no supporting news or credible source — not enough
 
 SHORT SIZING: same rules as longs. Stop-loss is price RISING above entry.
-  Day short: SL 1.5–3% above entry | TP 6–12% below entry
+  Day short:  SL 1.5–3% above entry | TP 6–12% below entry
+  Swing short: SL 4–8% above entry  | TP 12–25% below entry (for valuation-based shorts)
 
 ═══════════════════════════════════════════════════════
 DYNAMIC STOCK UNIVERSE — ANY stock or ETF on Alpaca
