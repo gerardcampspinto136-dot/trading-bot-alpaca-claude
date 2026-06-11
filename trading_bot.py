@@ -551,12 +551,19 @@ LEVERAGE FRAMEWORK — use only when conditions align
 You have access to regular instruments AND leveraged ETFs. Prefer leveraged ETFs
 over margin on regular stocks — they give clean, defined leverage.
 
-Leveraged ETF pairs (pick the right instrument directly in "symbol"):
+Leveraged ETF pairs — LONG (pick the right instrument directly in "symbol"):
   SPY  → SSO (2x)  → UPRO (3x)      QQQ  → QLD (2x)  → TQQQ (3x)
   IWM  → UWM (2x)  → TNA (3x)       DIA  → DDM (2x)  → UDOW (3x)
   SOXX → USD (2x)  → SOXL (3x)      XLF  → UYG (2x)  → FAS (3x)
   XLE  → DIG (2x)  → ERX (3x)       XBI  → — (2x)    → LABU (3x)
   GLD  → UGL (2x)  → — (3x)         TLT  → UBT (2x)  → — (3x)
+
+Inverse leveraged ETF pairs — SHORT exposure (use "buy" action on these tickers):
+  SPY  → SDS (2x)  → SPXU (3x)      QQQ  → QID (2x)  → SQQQ (3x)
+  IWM  → TWM (2x)  → SRTY (3x)      DIA  → DXD (2x)  → SDOW (3x)
+  SOXX → SSG (2x)  → SOXS (3x)      XLF  → SKF (2x)  → FAZ (3x)
+  XLE  → DUG (2x)  → ERY (3x)       XBI  → BIS (2x)  → LABD (3x)
+  GLD  → GLL (2x)  → — (3x)         TLT  → TBT (2x)  → TMV (3x)
 
 For individual stocks (no leveraged ETF equivalent): set "leverage": 2–5
   → Bot multiplies notional by that factor using available margin.
@@ -574,6 +581,36 @@ WHEN NOT TO USE LEVERAGE:
   ✗ High macro uncertainty (FOMC day, CPI day before release)
 
 Maximum effective leverage: 5x. Do not exceed.
+
+═══════════════════════════════════════════════════════
+SHORT SELLING — bet on price declines
+═══════════════════════════════════════════════════════
+Two ways to go short:
+
+1. INVERSE ETFs (preferred — no margin, defined risk):
+   Use "action": "buy" on an inverse ETF ticker (SQQQ, SPXU, SOXS, FAZ…).
+   Treat exactly like a regular buy. Leverage is embedded in the ticker.
+
+2. DIRECT SHORT (individual stocks only):
+   Use "action": "short" to borrow and sell shares.
+   Use "action": "cover" to close the full short position.
+   Use "action": "cover_partial" to close ~50% of the short position.
+   Leverage field applies the same way as with longs.
+
+WHEN TO GO SHORT (direct or inverse ETF):
+  ✓ A-tier NEGATIVE catalyst: earnings miss >10%, FDA rejection, Chapter 11, major scandal
+  ✓ Index breakdown: market-wide selloff with macro shock (CPI beat, Fed hawkish surprise)
+  ✓ Reversal fade: stock spiked >15% on a weak/fraudulent catalyst — fade the hype
+  ✓ Sector contagion: sector leader collapses, short high-beta peers
+
+WHEN NOT TO SHORT:
+  ✗ Strong uptrend without a clear catalyst reversal
+  ✗ Heavily shorted stock (short interest >20%) — risk of short squeeze
+  ✗ Earnings approaching for target (binary event risk)
+  ✗ Conviction ≤ 3 or catalyst is C-tier
+
+SHORT SIZING: same rules as longs. Stop-loss is price RISING above entry.
+  Day short: SL 1.5–3% above entry | TP 6–12% below entry
 
 ═══════════════════════════════════════════════════════
 DYNAMIC STOCK UNIVERSE — ANY stock or ETF on Alpaca
@@ -654,7 +691,7 @@ OUTPUT — ONLY valid JSON, no markdown fences, no extra text
   "actions": [
     {
       "symbol": "TICKER",
-      "action": "buy | close | partial_close | hold",
+      "action": "buy | short | close | cover | partial_close | cover_partial | hold",
       "trade_type": "day_trade | swing | position",
       "notional_usd": 2000,
       "leverage": 1,
@@ -676,11 +713,14 @@ Field notes:
   Default: 1.
 - "notional_usd": base dollar amount BEFORE leverage multiplier.
 - "catalyst_tier": A / B / C — drives sizing and leverage eligibility validation.
-- "partial_close": closes ~50% of position. No notional needed.
-- "close": fully exits. No notional needed.
+- "partial_close": closes ~50% of a long position. No notional needed.
+- "close": fully exits a long position. No notional needed.
+- "cover": fully closes a short position. No notional needed.
+- "cover_partial": closes ~50% of a short position. No notional needed.
 - "hold": logged, no order.
 - Empty "actions" array is correct and preferred when no setup meets criteria.
 - Crypto symbols: BTC/USD, ETH/USD, SOL/USD format. No leverage on crypto.
+- Do NOT short crypto.
 """
 
 
@@ -848,7 +888,60 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
                 except Exception as e:
                     log.error(f"  BUY {symbol} FAILED: {e}")
 
-        # ── CLOSE (full exit) ─────────────────────────────────────────────────
+        # ── SHORT (open a new short position) ────────────────────────────────
+        elif act == "short":
+            if is_crypto(symbol):
+                log.warning(f"  SKIP short {symbol}: crypto shorting not supported")
+                continue
+            if notional <= 0:
+                log.warning(f"  SKIP short {symbol}: notional_usd is 0")
+                continue
+
+            effective = notional * leverage
+
+            hard_cap = total_bp * 0.50
+            if effective > hard_cap:
+                log.info(f"  Capping short {symbol} at 50% BP: ${effective:.0f} → ${hard_cap:.0f}")
+                effective = hard_cap
+
+            bp_cap = buying_power * 0.95
+            if effective > bp_cap:
+                effective = bp_cap
+                log.info(f"  Capping short {symbol} to available buying_power: ${effective:.0f}")
+
+            if effective <= 0:
+                log.warning(f"  SKIP short {symbol}: insufficient buying power")
+                continue
+
+            if not is_asset_tradeable(trading_client, symbol):
+                log.warning(f"  SKIP short {symbol}: not tradeable on Alpaca")
+                continue
+
+            lev_tag = f" | LEV {leverage}x" if leverage > 1 else ""
+            targets = ""
+            if sl_pct:
+                targets += f" | SL: +{sl_pct}%"
+            if tp_pct:
+                targets += f" | TP: -{tp_pct}%"
+
+            order_req = MarketOrderRequest(
+                symbol=symbol,
+                notional=effective,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+            if dry_run:
+                log.info(f"  [DRY-RUN] SHORT ${effective:.0f} of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | {reason}")
+            else:
+                try:
+                    order = trading_client.submit_order(order_req)
+                    log.info(f"  SHORT ${effective:.0f} of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | order={order.id} | {reason}")
+                    buying_power -= effective
+                    open_positions[symbol] = {"symbol": symbol, "qty": 0}
+                except Exception as e:
+                    log.error(f"  SHORT {symbol} FAILED: {e}")
+
+        # ── CLOSE (full exit of long) ──────────────────────────────────────────
         elif act in ("close", "sell"):
             if symbol not in open_positions:
                 log.warning(f"  SKIP close {symbol}: no open position")
@@ -863,7 +956,22 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
                 except Exception as e:
                     log.error(f"  CLOSE {symbol} FAILED: {e}")
 
-        # ── PARTIAL CLOSE (~50%) ──────────────────────────────────────────────
+        # ── COVER (full exit of short) ─────────────────────────────────────────
+        elif act == "cover":
+            if symbol not in open_positions:
+                log.warning(f"  SKIP cover {symbol}: no open position")
+                continue
+            if dry_run:
+                log.info(f"  [DRY-RUN] COVER {symbol} | {reason}")
+            else:
+                try:
+                    trading_client.close_position(symbol)
+                    log.info(f"  COVER {symbol} | {reason}")
+                    open_positions.pop(symbol, None)
+                except Exception as e:
+                    log.error(f"  COVER {symbol} FAILED: {e}")
+
+        # ── PARTIAL CLOSE (~50% of long) ──────────────────────────────────────
         elif act == "partial_close":
             if symbol not in open_positions:
                 log.warning(f"  SKIP partial_close {symbol}: no open position")
@@ -876,6 +984,20 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
                     log.info(f"  PARTIAL CLOSE {symbol} (~50%) | {reason}")
                 except Exception as e:
                     log.error(f"  PARTIAL CLOSE {symbol} FAILED: {e}")
+
+        # ── COVER PARTIAL (~50% of short) ─────────────────────────────────────
+        elif act == "cover_partial":
+            if symbol not in open_positions:
+                log.warning(f"  SKIP cover_partial {symbol}: no open position")
+                continue
+            if dry_run:
+                log.info(f"  [DRY-RUN] COVER PARTIAL {symbol} (~50%) | {reason}")
+            else:
+                try:
+                    trading_client.close_position(symbol, ClosePositionRequest(percentage="0.5"))
+                    log.info(f"  COVER PARTIAL {symbol} (~50%) | {reason}")
+                except Exception as e:
+                    log.error(f"  COVER PARTIAL {symbol} FAILED: {e}")
 
         else:
             log.warning(f"  Unknown action '{act}' for {symbol} — skipping")
