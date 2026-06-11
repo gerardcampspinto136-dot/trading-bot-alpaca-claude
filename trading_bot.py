@@ -703,18 +703,25 @@ Apply the full analysis framework. Provide specific, actionable trading recommen
     try:
         response = ai_client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2048,
+            max_tokens=4096,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
         )
         raw = response.content[0].text.strip()
 
-        if raw.startswith("```"):
+        # Strip markdown fences if present
+        if "```" in raw:
             lines = raw.splitlines()
             raw = "\n".join(
                 line for line in lines
                 if not line.strip().startswith("```")
-            )
+            ).strip()
+
+        # Extract the outermost JSON object, ignoring any surrounding text
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            raw = raw[start : end + 1]
 
         result = json.loads(raw)
         log.info(f"Sentiment: {result.get('market_sentiment', '?').upper()} | Phase: {result.get('session_phase', phase)}")
