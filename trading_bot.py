@@ -80,14 +80,15 @@ ET = pytz.timezone("America/New_York")
 
 
 def next_run_time() -> datetime:
-    """Return the next fixed run slot (ET), skipping to next weekday if today's are done."""
+    """Return the next fixed run slot (ET), skipping weekends."""
     now = datetime.now(ET)
     today = now.date()
-    for hour, minute in RUN_TIMES_ET:
-        candidate = ET.localize(datetime(today.year, today.month, today.day, hour, minute))
-        if candidate > now:
-            return candidate
-    # All today's slots passed — advance to next weekday
+    if today.weekday() < 5:  # today is a weekday — check remaining slots
+        for hour, minute in RUN_TIMES_ET:
+            candidate = ET.localize(datetime(today.year, today.month, today.day, hour, minute))
+            if candidate > now:
+                return candidate
+    # No slots left today (or today is weekend) — advance to next weekday
     next_day = today + timedelta(days=1)
     while next_day.weekday() >= 5:
         next_day += timedelta(days=1)
@@ -394,12 +395,15 @@ def poll_telegram_hints() -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        import urllib.request
+        import urllib.request, ssl
+        _ssl_ctx = ssl.create_default_context()
+        _ssl_ctx.check_hostname = False
+        _ssl_ctx.verify_mode = ssl.CERT_NONE
         url = (
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
             f"/getUpdates?offset={_telegram_offset}&timeout=0"
         )
-        with urllib.request.urlopen(url, timeout=10) as resp:
+        with urllib.request.urlopen(url, timeout=10, context=_ssl_ctx) as resp:
             data = json.loads(resp.read())
 
         if not data.get("ok"):
@@ -449,7 +453,10 @@ def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
-        import urllib.request, urllib.parse
+        import urllib.request, urllib.parse, ssl
+        _ssl_ctx = ssl.create_default_context()
+        _ssl_ctx.check_hostname = False
+        _ssl_ctx.verify_mode = ssl.CERT_NONE
         payload = json.dumps({
             "chat_id":    TELEGRAM_CHAT_ID,
             "text":       message,
@@ -460,7 +467,7 @@ def send_telegram(message: str) -> None:
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-        urllib.request.urlopen(req, timeout=10)
+        urllib.request.urlopen(req, timeout=10, context=_ssl_ctx)
         log.info("Telegram notification sent.")
     except Exception as e:
         log.warning(f"Telegram notification failed: {e}")
