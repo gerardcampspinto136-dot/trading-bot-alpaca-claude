@@ -19,6 +19,9 @@ env/
 # Bot logs
 *.log
 
+# Runtime state (the day's actions, regenerated each day)
+daily_state.json
+
 # IDE / tool settings
 .claude/
 .vscode/

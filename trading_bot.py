@@ -16,11 +16,14 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import anthropic
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import (
+    MarketOrderRequest, ClosePositionRequest, TakeProfitRequest, StopLossRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import NewsRequest, StockLatestQuoteRequest
+from alpaca.data.requests import NewsRequest, StockLatestQuoteRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -61,6 +64,9 @@ MAX_LEVERAGE     = float(os.getenv("MAX_LEVERAGE", "5.0"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 HINTS_FILE         = "hints.txt"
+STATE_FILE         = "daily_state.json"   # remembers the day's actions across runs
+
+ANALYSIS_MODEL     = "claude-opus-4-8"    # strongest reasoning model for the trade decision
 
 # Base ETF → 2x → 3x leveraged equivalents
 LEVERAGE_MAP: dict[str, dict] = {
@@ -94,6 +100,40 @@ def next_run_time() -> datetime:
         next_day += timedelta(days=1)
     hour, minute = RUN_TIMES_ET[0]
     return ET.localize(datetime(next_day.year, next_day.month, next_day.day, hour, minute))
+
+
+def run_slot_position() -> tuple[bool, bool]:
+    """Return (is_first_slot, is_last_slot) for the run we are executing, by ET time."""
+    now = datetime.now(ET)
+    minutes_now = now.hour * 60 + now.minute
+    slot_minutes = [h * 60 + m for h, m in RUN_TIMES_ET]
+    # The slot being executed is the latest one at/before now (15-min tolerance for jitter).
+    past = [i for i, sm in enumerate(slot_minutes) if minutes_now >= sm - 15]
+    idx = past[-1] if past else 0
+    return idx == 0, idx == len(slot_minutes) - 1
+
+
+# ── Daily state (memory across runs) ────────────────────────────────────────────
+
+def load_state() -> dict:
+    """Load today's running state, or a fresh state if it's a new day / missing."""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if state.get("date") == today:
+            return state
+    except Exception:
+        pass
+    return {"date": today, "cycles": [], "start_portfolio_value": None}
+
+
+def save_state(state: dict) -> None:
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        log.warning(f"Could not save {STATE_FILE}: {e}")
 
 
 FT_RSS_FEEDS = [
@@ -206,10 +246,11 @@ def fetch_alpaca_news(news_client: NewsClient, lookback_hours: int = 3) -> list[
 
         articles = []
         for a in unwrapped:
+            summary = _field(a, "summary")
             articles.append({
                 "source":    "Alpaca/" + (_field(a, "source") or "news"),
                 "headline":  _field(a, "headline"),
-                "summary":   _field(a, "summary"),
+                "summary":   summary[:240] if summary else "",
                 "symbols":   _field(a, "symbols") or [],
                 "published": str(_field(a, "created_at")),
             })
@@ -262,7 +303,7 @@ def fetch_ft_news(lookback_hours: int = 4) -> list[dict]:
                 articles.append({
                     "source":    "Financial Times",
                     "headline":  title,
-                    "summary":   summary[:400] if summary else "",
+                    "summary":   summary[:240] if summary else "",
                     "symbols":   [],  # Claude extracts tickers from text
                     "published": pub_str,
                 })
@@ -298,24 +339,84 @@ def fetch_all_news(news_client: NewsClient, lookback_hours: int = 3) -> list[dic
 
 # ── Prices ────────────────────────────────────────────────────────────────────
 
-def fetch_prices(stock_data_client: StockHistoricalDataClient, symbols: list[str]) -> dict:
+def fetch_market_data(stock_data_client: StockHistoricalDataClient, symbols: list[str]) -> dict:
+    """Per symbol: live price + context (prev close, day OHLC, % moves, relative volume).
+
+    Gives Claude the price action its strategy actually needs (gaps, intraday
+    direction, volume), instead of a single bare quote.
+    """
     stock_syms = [s for s in symbols if "/" not in s and s]
     if not stock_syms:
         return {}
+
+    data: dict[str, dict] = {}
+
+    # 1) Daily bars → previous close, today's range, average + relative volume.
+    try:
+        end   = datetime.now(pytz.utc)
+        start = end - timedelta(days=45)  # ~30 trading days
+        bars = stock_data_client.get_stock_bars(
+            StockBarsRequest(symbol_or_symbols=stock_syms, timeframe=TimeFrame.Day, start=start)
+        )
+        bar_map  = bars.data if hasattr(bars, "data") else {}
+        today_et = datetime.now(ET).date()
+        for sym, sym_bars in bar_map.items():
+            if not sym_bars:
+                continue
+            last = sym_bars[-1]
+            try:
+                last_date = last.timestamp.astimezone(ET).date()
+            except Exception:
+                last_date = None
+            vols = [b.volume for b in sym_bars]
+            if last_date == today_et and len(sym_bars) >= 2:
+                today_bar  = last
+                prev_close = sym_bars[-2].close
+                hist_vols  = vols[:-1]
+            else:
+                today_bar  = None
+                prev_close = last.close
+                hist_vols  = vols
+            recent_vols = hist_vols[-20:]
+            avg_vol = (sum(recent_vols) / len(recent_vols)) if recent_vols else 0
+            entry = {"prev_close": round(prev_close, 2)}
+            if today_bar is not None:
+                entry["open"]     = round(today_bar.open, 2)
+                entry["day_high"] = round(today_bar.high, 2)
+                entry["day_low"]  = round(today_bar.low, 2)
+                if avg_vol:
+                    entry["rel_volume"] = round(today_bar.volume / avg_vol, 2)
+            data[sym] = entry
+    except Exception as e:
+        log.warning(f"Daily bars fetch failed: {e} — continuing with quotes only")
+
+    # 2) Latest quote → live price (works pre/post market).
     try:
         quotes = stock_data_client.get_stock_latest_quote(
             StockLatestQuoteRequest(symbol_or_symbols=stock_syms)
         )
-        prices = {}
         for sym, q in quotes.items():
             price = getattr(q, "ask_price", None) or getattr(q, "bid_price", None)
             if price and float(price) > 0:
-                prices[sym] = round(float(price), 4)
-        log.info(f"Fetched prices for {len(prices)}/{len(stock_syms)} symbols")
-        return prices
+                data.setdefault(sym, {})["price"] = round(float(price), 2)
     except Exception as e:
-        log.warning(f"Price fetch failed: {e} — continuing without prices")
-        return {}
+        log.warning(f"Quote fetch failed: {e}")
+
+    # 3) Derive % moves; fill missing price from bar data so every symbol has one.
+    out: dict[str, dict] = {}
+    for sym, d in data.items():
+        price = d.get("price") or d.get("open") or d.get("prev_close")
+        if not price:
+            continue
+        d["price"] = price
+        if d.get("prev_close"):
+            d["pct_from_prev_close"] = round((price - d["prev_close"]) / d["prev_close"] * 100, 2)
+        if d.get("open"):
+            d["pct_from_open"] = round((price - d["open"]) / d["open"] * 100, 2)
+        out[sym] = d
+
+    log.info(f"Market data for {len(out)}/{len(stock_syms)} symbols")
+    return out
 
 
 # ── Portfolio ─────────────────────────────────────────────────────────────────
@@ -473,39 +574,74 @@ def send_telegram(message: str) -> None:
         log.warning(f"Telegram notification failed: {e}")
 
 
-def format_notification(analysis: dict, phase: str) -> str:
-    """Build a short Telegram message summarising the cycle."""
-    now_str   = datetime.now(ET).strftime("%H:%M ET")
-    sentiment = analysis.get("market_sentiment", "?").upper()
-    actions   = [a for a in analysis.get("actions", []) if a.get("action", "hold") != "hold"]
+def build_day_summary(ai_client: anthropic.Anthropic, state: dict, portfolio: dict) -> str:
+    """End-of-day Telegram message: the day's actions + a short reasoning summary."""
+    cycles      = state.get("cycles", [])
+    all_actions = [a for c in cycles for a in c.get("actions", [])]
+    start_val   = state.get("start_portfolio_value")
+    end_val     = portfolio.get("portfolio_value")
 
-    EMOJI = {"buy": "BUY", "close": "CLOSE", "partial_close": "PARTIAL CLOSE"}
-    lines = [
-        f"*Trading Bot* | {now_str} | {phase.upper()}",
-        f"Sentiment: {sentiment}",
-    ]
+    day_change = ""
+    if start_val and end_val:
+        diff = end_val - start_val
+        pct  = (diff / start_val * 100) if start_val else 0
+        day_change = f"${diff:+,.2f} ({pct:+.2f}%)"
 
-    catalyst = analysis.get("catalyst_summary", "")
-    if catalyst:
-        lines.append(f"_{catalyst[:120]}_")
+    open_pos  = portfolio.get("positions", [])
+    total_upl = sum(p.get("unrealized_pl", 0) for p in open_pos)
 
+    # Prefer a concise Claude-written narrative; fall back to a plain format on any error.
+    try:
+        payload = {
+            "date":            state.get("date"),
+            "actions_today":   all_actions,
+            "portfolio_value": end_val,
+            "day_change":      day_change or "n/a",
+            "open_positions":  [
+                {"symbol": p["symbol"], "qty": p["qty"], "unrealized_plpc": p.get("unrealized_plpc")}
+                for p in open_pos
+            ],
+        }
+        resp = ai_client.messages.create(
+            model=ANALYSIS_MODEL,
+            max_tokens=600,
+            system=(
+                "You write a concise end-of-day summary of an automated trading bot's day "
+                "for a Telegram message. Plain text, no markdown headers, under 120 words. "
+                "Cover briefly: what was traded and why, how the portfolio did, and what is "
+                "held overnight into tomorrow. Output only the summary."
+            ),
+            messages=[{"role": "user", "content": json.dumps(payload, separators=(",", ":"))}],
+        )
+        text = "\n".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+        if text:
+            header = f"*Daily Summary — {state.get('date')}*"
+            if day_change:
+                header += f"\nP&L today: {day_change}"
+            return f"{header}\n\n{text}"
+    except Exception as e:
+        log.warning(f"Day summary generation failed: {e} — using plain format")
+
+    return _format_day_summary_fallback(state, all_actions, day_change, total_upl)
+
+
+def _format_day_summary_fallback(state: dict, all_actions: list, day_change: str, total_upl: float) -> str:
+    lines = [f"*Daily Summary — {state.get('date')}*"]
+    if day_change:
+        lines.append(f"P&L today: {day_change}")
     lines.append("")
-
-    if actions:
-        lines.append("*Actions:*")
-        for a in actions:
-            sym     = a.get("symbol", "?")
-            act     = EMOJI.get(a.get("action", ""), a.get("action", "").upper())
-            reason  = a.get("reasoning", "")
-            short_r = reason[:100] + ("…" if len(reason) > 100 else "")
-            notl    = a.get("notional_usd", 0)
-            if a.get("action") == "buy":
-                lines.append(f"• {act} ${notl:,.0f} *{sym}* — {short_r}")
-            else:
-                lines.append(f"• {act} *{sym}* — {short_r}")
+    if all_actions:
+        lines.append(f"*Actions taken ({len(all_actions)}):*")
+        for a in all_actions:
+            act = (a.get("action") or "").upper()
+            sym = a.get("symbol", "?")
+            r   = (a.get("reasoning") or "")[:90]
+            lines.append(f"• {act} {sym} — {r}")
     else:
-        lines.append("_No trades — no setup met criteria this cycle._")
-
+        lines.append("_No trades taken today._")
+    lines.append(f"\nOpen unrealized P&L: ${total_upl:,.2f}")
     return "\n".join(lines)
 
 
@@ -528,7 +664,8 @@ Most reliable setup for news-driven day trading:
    - opening (9:30–10:30): enter on first 5-min candle breakout above pre-market high.
    - intraday: enter only when price breaks a clear level with volume surge.
 4. SCALE OUT: Partial close at first target, trail remainder.
-5. HARD CLOSE: ALL day_trade positions by 15:45 ET without exception.
+5. AUTO-EXIT: stop_loss_pct and take_profit_pct are placed as live bracket orders
+   at entry, so they trigger automatically between runs — set them deliberately.
 
 Secondary setups (use when Gap-and-Go not available):
 • MOMENTUM CONTINUATION — ride established intraday trend, enter on pullbacks to VWAP.
@@ -648,9 +785,10 @@ when you want leveraged index/sector exposure.
 ═══════════════════════════════════════════════════════
 TRADING HORIZONS
 ═══════════════════════════════════════════════════════
-• day_trade  — Open AND close same session. PRIMARY focus. Best ROI/risk ratio.
+• day_trade  — Typically open AND close same session. PRIMARY focus. Best ROI/risk ratio.
                Requires: A or B-tier catalyst, opening/power_hour phase, or confirmed momentum.
-               HARD RULE: ALL day_trade positions MUST be closed by 15:45 ET.
+               At the FINAL run of the day you decide per position: close it to avoid
+               overnight risk, or hold overnight when the thesis and risk clearly justify it.
 • swing      — Hold 1–5 days. For B-tier multi-day thesis or post-earnings drift.
 • position   — Weeks to months. Only for structural A-tier thesis with strong conviction.
 
@@ -666,8 +804,11 @@ mid_morning (10:30–11:30): Trend confirmation. Enter only on strong, establish
 lunch_lull  (11:30–14:00): LOW ACTIVITY. No new leveraged positions. Take profits.
                             Tighten stops on existing. Close marginal trades.
 afternoon   (14:00–15:30): Institutional re-entry. Trend following OK. Watch for reversals.
-power_hour  (15:30–15:45): Close ALL day trades. Use volume surge to exit at best price.
-after_hours (after 16:00): No new positions. Note catalysts for next session.
+power_hour  (15:30–16:00): Decide exits. Use the volume surge to exit anything you don't
+                            want to carry overnight at the best price.
+after_hours (after 16:00): FINAL run. Review EVERY open position and decide explicitly —
+                            close it, or hold it overnight if the thesis and risk justify
+                            carrying it. No new day-trade entries this late.
 
 ═══════════════════════════════════════════════════════
 POSITION SIZING
@@ -682,7 +823,8 @@ Base notional (BEFORE leverage) as % of buying_power:
 ═══════════════════════════════════════════════════════
 EXIT DISCIPLINE
 ═══════════════════════════════════════════════════════
-Always set stop_loss_pct and take_profit_pct. These are logged and monitored.
+Always set stop_loss_pct and take_profit_pct. They are placed as LIVE bracket orders
+the moment a position opens, so they auto-exit between runs without waiting for the next cycle.
   Day trade: SL 1.5–3% | TP 6–12% first target, trail remainder
   Swing:     SL 4–8%   | TP 12–25%
   Position:  SL 8–15%  | TP 25–60%
@@ -752,17 +894,37 @@ def analyze(
     ai_client: anthropic.Anthropic,
     news: list[dict],
     portfolio: dict,
-    prices: dict,
+    market: dict,
     phase: str,
     user_hints: str = "",
+    day_history: list[dict] | None = None,
+    is_last_run: bool = False,
 ) -> dict | None:
-    news_blob      = json.dumps(news[:40], indent=2)
-    portfolio_blob = json.dumps(portfolio, indent=2)
-    prices_blob    = json.dumps(prices, indent=2) if prices else "{}"
+    # Compact JSON — no indentation — to cut input tokens with zero loss of information.
+    news_blob      = json.dumps(news[:40], separators=(",", ":"))
+    portfolio_blob = json.dumps(portfolio, separators=(",", ":"))
+    market_blob    = json.dumps(market, separators=(",", ":")) if market else "{}"
 
     hints_section = ""
     if user_hints:
         hints_section = f"\n=== OWNER GUIDANCE (apply this when analysing) ===\n{user_hints}\n"
+
+    # Memory: what was already done earlier today, so Claude manages rather than re-decides.
+    memory_section = ""
+    if day_history:
+        memory_section = (
+            "\n=== ACTIONS YOU ALREADY TOOK EARLIER TODAY (manage these, don't re-open blindly) ===\n"
+            + json.dumps(day_history, separators=(",", ":")) + "\n"
+        )
+
+    last_run_section = ""
+    if is_last_run:
+        last_run_section = (
+            "\n=== THIS IS THE FINAL RUN OF THE TRADING DAY ===\n"
+            "For EACH open position decide explicitly: close it now to avoid overnight risk, "
+            "or hold it overnight only if the thesis and risk clearly justify carrying it. "
+            "Close day-trade positions unless there is a strong reason to hold.\n"
+        )
 
     user_msg = f"""\
 CURRENT DATE/TIME (ET): {datetime.now(ET).strftime('%Y-%m-%d %H:%M')}
@@ -770,12 +932,14 @@ MARKET SESSION PHASE: {phase}
 AVAILABLE BUYING POWER: ${portfolio['buying_power']:,.2f}
 PORTFOLIO VALUE: ${portfolio['portfolio_value']:,.2f}
 OPEN POSITIONS: {len(portfolio['positions'])}
-{hints_section}
+{hints_section}{memory_section}{last_run_section}
 === RECENT FINANCIAL NEWS (Alpaca + Financial Times) ===
 {news_blob}
 
-=== CURRENT MARKET PRICES (watchlist + news symbols + holdings) ===
-{prices_blob}
+=== MARKET DATA (per symbol: price, prev_close, open, day_high, day_low, pct_from_prev_close, pct_from_open, rel_volume) ===
+{market_blob}
+Use pct_from_prev_close for the gap / day move, pct_from_open for intraday direction,
+and rel_volume (>1 = above-average volume) to confirm momentum before acting.
 
 === CURRENT PORTFOLIO ===
 {portfolio_blob}
@@ -785,12 +949,23 @@ Apply the full analysis framework. Provide specific, actionable trading recommen
 """
     try:
         response = ai_client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
+            model=ANALYSIS_MODEL,
+            max_tokens=8000,
+            thinking={"type": "adaptive"},
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_msg}],
         )
-        raw = response.content[0].text.strip()
+
+        if response.stop_reason == "max_tokens":
+            log.warning("Claude hit max_tokens — JSON may be truncated this cycle.")
+
+        # Pull the text block (adaptive thinking emits a separate thinking block first).
+        raw = "\n".join(
+            b.text for b in response.content if getattr(b, "type", None) == "text"
+        ).strip()
+        if not raw:
+            log.error("Claude returned no text content this cycle.")
+            return None
 
         # Strip markdown fences if present
         if "```" in raw:
@@ -825,6 +1000,11 @@ Apply the full analysis framework. Provide specific, actionable trading recommen
 
 def is_crypto(symbol: str) -> bool:
     return "/" in symbol
+
+
+def _round_tick(price: float) -> float:
+    """Round to a valid order price (penny for >= $1, else 4 decimals)."""
+    return round(price, 2) if price >= 1 else round(price, 4)
 
 
 def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict, dry_run: bool, prices: dict | None = None) -> None:
@@ -887,26 +1067,36 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
                 log.warning(f"  SKIP buy {symbol}: not tradeable on Alpaca")
                 continue
 
-            tif = TimeInForce.GTC if is_crypto(symbol) else TimeInForce.DAY
-            order_req = MarketOrderRequest(
-                symbol=symbol,
-                notional=effective,
-                side=OrderSide.BUY,
-                time_in_force=tif,
-            )
-            targets = ""
-            if sl_pct:
-                targets += f" | SL: -{sl_pct}%"
-            if tp_pct:
-                targets += f" | TP: +{tp_pct}%"
-            lev_tag = f" | LEV {leverage}x" if leverage > 1 else ""
+            price  = (prices or {}).get(symbol)
+            crypto = is_crypto(symbol)
+            qty    = int(effective / price) if (price and price > 0) else 0
+            use_bracket = (not crypto) and qty >= 1 and sl_pct and tp_pct
 
+            if use_bracket:
+                tp_price = _round_tick(price * (1 + tp_pct / 100))
+                sl_price = _round_tick(price * (1 - sl_pct / 100))
+                order_req = MarketOrderRequest(
+                    symbol=symbol, qty=qty, side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC, order_class=OrderClass.BRACKET,
+                    take_profit=TakeProfitRequest(limit_price=tp_price),
+                    stop_loss=StopLossRequest(stop_price=sl_price),
+                )
+                exec_note = f"{qty}sh | auto SL ${sl_price} / TP ${tp_price}"
+            else:
+                tif = TimeInForce.GTC if crypto else TimeInForce.DAY
+                order_req = MarketOrderRequest(
+                    symbol=symbol, notional=effective, side=OrderSide.BUY, time_in_force=tif,
+                )
+                tgt = (f" SL-{sl_pct}%" if sl_pct else "") + (f" TP+{tp_pct}%" if tp_pct else "")
+                exec_note = f"${effective:.0f} | no bracket (targets:{tgt or ' none'})"
+
+            lev_tag = f" | LEV {leverage}x" if leverage > 1 else ""
             if dry_run:
-                log.info(f"  [DRY-RUN] BUY ${effective:.0f} of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | {reason}")
+                log.info(f"  [DRY-RUN] BUY {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}] {exec_note} | {reason}")
             else:
                 try:
                     order = trading_client.submit_order(order_req)
-                    log.info(f"  BUY ${effective:.0f} of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | order={order.id} | {reason}")
+                    log.info(f"  BUY {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}] {exec_note} | order={order.id} | {reason}")
                     buying_power -= effective
                     open_positions[symbol] = {"symbol": symbol, "qty": 0}
                 except Exception as e:
@@ -952,24 +1142,29 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
                 continue
 
             lev_tag = f" | LEV {leverage}x" if leverage > 1 else ""
-            targets = ""
-            if sl_pct:
-                targets += f" | SL: +{sl_pct}%"
-            if tp_pct:
-                targets += f" | TP: -{tp_pct}%"
 
-            order_req = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-            )
+            if sl_pct and tp_pct:
+                tp_price = _round_tick(price * (1 - tp_pct / 100))   # profit when price falls
+                sl_price = _round_tick(price * (1 + sl_pct / 100))   # loss when price rises
+                order_req = MarketOrderRequest(
+                    symbol=symbol, qty=qty, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC, order_class=OrderClass.BRACKET,
+                    take_profit=TakeProfitRequest(limit_price=tp_price),
+                    stop_loss=StopLossRequest(stop_price=sl_price),
+                )
+                exec_note = f"{qty}sh (~${effective:.0f}) | auto SL ${sl_price} / TP ${tp_price}"
+            else:
+                order_req = MarketOrderRequest(
+                    symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+                )
+                exec_note = f"{qty}sh (~${effective:.0f}) | no bracket"
+
             if dry_run:
-                log.info(f"  [DRY-RUN] SHORT {qty} shares (~${effective:.0f}) of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | {reason}")
+                log.info(f"  [DRY-RUN] SHORT {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}] {exec_note} | {reason}")
             else:
                 try:
                     order = trading_client.submit_order(order_req)
-                    log.info(f"  SHORT {qty} shares (~${effective:.0f}) of {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}]{targets} | order={order.id} | {reason}")
+                    log.info(f"  SHORT {symbol} [{ttype} | tier={tier} | conv={conv}{lev_tag}] {exec_note} | order={order.id} | {reason}")
                     buying_power -= effective
                     open_positions[symbol] = {"symbol": symbol, "qty": 0}
                 except Exception as e:
@@ -1039,26 +1234,37 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
 
 # ── Main cycle ────────────────────────────────────────────────────────────────
 
-def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run: bool) -> None:
-    if not in_trading_window():
+def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run: bool, force: bool = False) -> None:
+    if not force and not in_trading_window():
         log.info("Outside trading window — waiting.")
         return
 
     phase = session_phase()
+    state = load_state()
+    is_first_run   = len(state.get("cycles", [])) == 0
+    _, is_last_run = run_slot_position()
+
     log.info("-" * 60)
-    log.info(f"Cycle start: {datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')} | Session: {phase.upper()}")
+    log.info(
+        f"Cycle start: {datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')} | Session: {phase.upper()} "
+        f"| first_run={is_first_run} last_run={is_last_run}"
+    )
     log.info("-" * 60)
 
-    poll_telegram_hints()
+    # Telegram: only check for owner suggestions on the FIRST run of the day.
+    if is_first_run:
+        poll_telegram_hints()
 
-    lookback = NEWS_LOOKBACK_HOURS
-    news      = fetch_all_news(news_client, lookback_hours=lookback)
+    news      = fetch_all_news(news_client, lookback_hours=NEWS_LOOKBACK_HOURS)
     portfolio = get_portfolio(trading_client)
+    if state.get("start_portfolio_value") is None:
+        state["start_portfolio_value"] = portfolio["portfolio_value"]
 
     news_syms   = [s for a in news for s in a.get("symbols", [])]
     held_syms   = [p["symbol"] for p in portfolio["positions"]]
     all_symbols = list(set(news_syms + WATCHLIST + held_syms))
-    prices      = fetch_prices(stock_data_client, all_symbols)
+    market      = fetch_market_data(stock_data_client, all_symbols)
+    price_map   = {s: d["price"] for s, d in market.items() if "price" in d}
 
     log.info(
         f"Portfolio: ${portfolio['portfolio_value']:,.2f} | "
@@ -1067,15 +1273,42 @@ def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run
     )
 
     hints    = load_user_hints()
-    analysis = analyze(ai_client, news, portfolio, prices, phase, user_hints=hints)
+    analysis = analyze(
+        ai_client, news, portfolio, market, phase,
+        user_hints=hints, day_history=state.get("cycles", []), is_last_run=is_last_run,
+    )
     if analysis is None:
         log.error("Analysis failed — skipping execution this cycle.")
+        save_state(state)
         return
 
-    execute(trading_client, analysis.get("actions", []), portfolio, dry_run, prices=prices)
+    actions = analysis.get("actions", [])
+    execute(trading_client, actions, portfolio, dry_run, prices=price_map)
 
-    notification = format_notification(analysis, phase)
-    send_telegram(notification)
+    # Memory: remember what we did this cycle (for later runs + the end-of-day summary).
+    executed = [
+        {
+            "symbol":     a.get("symbol"),
+            "action":     a.get("action"),
+            "trade_type": a.get("trade_type"),
+            "reasoning":  (a.get("reasoning") or "")[:200],
+        }
+        for a in actions if a.get("action", "hold") != "hold"
+    ]
+    state.setdefault("cycles", []).append({
+        "time":      datetime.now(ET).strftime("%H:%M"),
+        "phase":     phase,
+        "sentiment": analysis.get("market_sentiment", ""),
+        "catalyst":  (analysis.get("catalyst_summary", "") or "")[:300],
+        "actions":   executed,
+    })
+    save_state(state)
+
+    # Telegram: only send a day summary at the LAST run of the day.
+    if is_last_run:
+        summary = build_day_summary(ai_client, state, portfolio)
+        send_telegram(summary)
+
     log.info("Cycle complete.\n")
 
 
@@ -1119,14 +1352,14 @@ def main():
 
     trading_client, news_client, stock_data_client, ai_client = build_clients()
 
-    poll_telegram_hints()  # pick up any messages sent while bot was offline
+    # Owner suggestions are checked on the first run of each day (see run_cycle).
 
     def cycle():
         run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run=args.dry_run)
 
     if args.once:
         log.info("Running single cycle (--once flag ignores market-hours guard).")
-        run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run=True)
+        run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run=True, force=True)
         return
 
     try:
