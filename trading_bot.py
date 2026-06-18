@@ -1008,7 +1008,67 @@ def _round_tick(price: float) -> float:
     return round(price, 2) if price >= 1 else round(price, 4)
 
 
-def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict, dry_run: bool, prices: dict | None = None) -> None:
+def fetch_latest_price(stock_data_client, symbol: str) -> float | None:
+    """Single-symbol fresh quote, used right before a retry so the stop is
+    computed against a current reference price (pre-market spreads drift fast)."""
+    try:
+        quotes = stock_data_client.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+        )
+        q = quotes.get(symbol)
+        if q:
+            price = getattr(q, "ask_price", None) or getattr(q, "bid_price", None)
+            if price and float(price) > 0:
+                return round(float(price), 2)
+    except Exception as e:
+        log.warning(f"  Fresh quote fetch failed for {symbol}: {e}")
+    return None
+
+
+def _retry_buy_bracket_then_market(trading_client, stock_data_client, symbol, qty,
+                                   effective, sl_pct, tp_pct, first_error):
+    """A bracket BUY was rejected (usually a stale-price stop above Alpaca's
+    base_price). Refetch a fresh quote, retry the bracket with the stop clamped
+    strictly below it, and only if that also fails fall back to a plain market
+    order so the trade isn't lost. Returns the order, or None if all attempts
+    fail. The dropped stop on the fallback path is re-attached on a later cycle."""
+    log.warning(f"  BUY {symbol} bracket rejected ({first_error}); retrying with fresh price.")
+
+    fresh = fetch_latest_price(stock_data_client, symbol) if stock_data_client else None
+    if fresh:
+        # Stop must sit strictly below Alpaca's reference; clamp to <= fresh - 1 tick
+        # so a tight sl_pct can never land at/above base_price.
+        sl_price = _round_tick(min(fresh * (1 - sl_pct / 100), fresh - 0.01))
+        tp_price = _round_tick(fresh * (1 + tp_pct / 100))
+        if 0 < sl_price < fresh < tp_price:
+            try:
+                order = trading_client.submit_order(MarketOrderRequest(
+                    symbol=symbol, qty=qty, side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC, order_class=OrderClass.BRACKET,
+                    take_profit=TakeProfitRequest(limit_price=tp_price),
+                    stop_loss=StopLossRequest(stop_price=sl_price),
+                ))
+                log.info(f"  BUY {symbol} bracket retry OK | {qty}sh | "
+                         f"SL ${sl_price} / TP ${tp_price} | order={order.id}")
+                return order
+            except Exception as e2:
+                log.warning(f"  BUY {symbol} bracket retry failed ({e2}); "
+                            f"falling back to plain market order.")
+
+    # Fallback: plain market order, no bracket. Stop re-attached next cycle.
+    try:
+        order = trading_client.submit_order(MarketOrderRequest(
+            symbol=symbol, notional=effective, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+        ))
+        log.info(f"  BUY {symbol} placed WITHOUT bracket (${effective:.0f}) | "
+                 f"order={order.id} | stop re-attached next cycle")
+        return order
+    except Exception as e3:
+        log.error(f"  BUY {symbol} FAILED after retries: {e3}")
+        return None
+
+
+def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict, dry_run: bool, prices: dict | None = None, stock_data_client=None) -> None:
     if not actions:
         log.info("No trading actions this cycle.")
         return
@@ -1101,7 +1161,17 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
                     buying_power -= effective
                     open_positions[symbol] = {"symbol": symbol, "qty": 0}
                 except Exception as e:
-                    log.error(f"  BUY {symbol} FAILED: {e}")
+                    order = None
+                    if use_bracket:
+                        order = _retry_buy_bracket_then_market(
+                            trading_client, stock_data_client, symbol, qty,
+                            effective, sl_pct, tp_pct, first_error=e,
+                        )
+                    if order:
+                        buying_power -= effective
+                        open_positions[symbol] = {"symbol": symbol, "qty": 0}
+                    else:
+                        log.error(f"  BUY {symbol} FAILED: {e}")
 
         # ── SHORT (open a new short position) ────────────────────────────────
         elif act == "short":
@@ -1284,7 +1354,7 @@ def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run
         return
 
     actions = analysis.get("actions", [])
-    execute(trading_client, actions, portfolio, dry_run, prices=price_map)
+    execute(trading_client, actions, portfolio, dry_run, prices=price_map, stock_data_client=stock_data_client)
 
     # Memory: remember what we did this cycle (for later runs + the end-of-day summary).
     executed = [
