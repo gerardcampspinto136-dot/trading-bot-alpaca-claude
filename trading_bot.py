@@ -47,8 +47,9 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 PAPER_TRADING     = os.getenv("PAPER_TRADING", "true").lower() == "true"
 MAX_POSITIONS     = int(os.getenv("MAX_TOTAL_POSITIONS", "20"))
 
-# Fixed daily run times in ET — 5 runs, every 2 hours
-RUN_TIMES_ET      = [(8, 30), (10, 30), (12, 30), (14, 30), (16, 30)]
+# Fixed daily run times in ET. Last run is 15:50 (before the 16:00 close) so the
+# end-of-day close/hold decision can actually fill while the market is still open.
+RUN_TIMES_ET      = [(8, 30), (10, 30), (12, 30), (14, 30), (15, 50)]
 NEWS_LOOKBACK_HOURS = 3  # look back slightly more than the 2-hour cycle
 
 _watchlist_raw = os.getenv(
