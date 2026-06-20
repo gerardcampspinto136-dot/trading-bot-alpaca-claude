@@ -18,6 +18,7 @@ import anthropic
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest, ClosePositionRequest, TakeProfitRequest, StopLossRequest,
+    GetCalendarRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical.news import NewsClient
@@ -200,6 +201,32 @@ def in_trading_window() -> bool:
     start = now.replace(hour=8,  minute=0,  second=0, microsecond=0)
     end   = now.replace(hour=17, minute=30, second=0, microsecond=0)
     return start <= now <= end
+
+
+_trading_day_cache: dict[str, bool] = {}
+
+def is_exchange_trading_day(trading_client: TradingClient) -> bool:
+    """True only if today is an actual exchange trading day.
+
+    The weekday check in in_trading_window() is not enough: market holidays
+    (Juneteenth, Thanksgiving, etc.) fall on weekdays, and on those days orders
+    are merely 'accepted' by Alpaca and never fill because the exchange is closed.
+    Alpaca's official calendar is the source of truth — get_calendar() returns the
+    day only if it's a trading session, so an empty result means it's a holiday.
+    Cached per day to avoid repeat API calls across the 5 daily runs.
+    """
+    key = datetime.now(ET).date().isoformat()
+    if key in _trading_day_cache:
+        return _trading_day_cache[key]
+    try:
+        today = datetime.now(ET).date()
+        calendar = trading_client.get_calendar(GetCalendarRequest(start=today, end=today))
+        is_trading = len(list(calendar)) > 0
+    except Exception as e:
+        log.warning(f"Market calendar check failed: {e} — assuming it's a trading day.")
+        return True  # fail open: don't block trading just because the calendar lookup hiccupped
+    _trading_day_cache[key] = is_trading
+    return is_trading
 
 
 def session_phase() -> str:
@@ -1308,6 +1335,10 @@ def execute(trading_client: TradingClient, actions: list[dict], portfolio: dict,
 def run_cycle(trading_client, news_client, stock_data_client, ai_client, dry_run: bool, force: bool = False) -> None:
     if not force and not in_trading_window():
         log.info("Outside trading window — waiting.")
+        return
+
+    if not force and not is_exchange_trading_day(trading_client):
+        log.info("Market holiday — exchange closed today. Skipping cycle (orders would never fill).")
         return
 
     phase = session_phase()
